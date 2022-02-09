@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build windows
 // +build windows
 
 package fsnotify
@@ -19,16 +18,20 @@ import (
 	"unsafe"
 )
 
+const defaultBufSize = 4096
+
 // Watcher watches a set of files, delivering events to a channel.
 type Watcher struct {
-	Events   chan Event
-	Errors   chan error
-	isClosed bool           // Set to true when Close() is first called
-	mu       sync.Mutex     // Map access
-	port     syscall.Handle // Handle to completion port
-	watches  watchMap       // Map of watches (key: i-number)
-	input    chan *input    // Inputs to the reader are sent on this channel
-	quit     chan chan<- error
+	Events    chan Event
+	Errors    chan error
+	isClosed  bool           // Set to true when Close() is first called
+	mu        sync.Mutex     // Map access
+	port      syscall.Handle // Handle to completion port
+	watches   watchMap       // Map of watches (key: i-number)
+	input     chan *input    // Inputs to the reader are sent on this channel
+	quit      chan chan<- error
+	recursive bool
+	bufSize   int
 }
 
 // NewWatcher establishes a new watcher with the underlying OS and begins waiting for events.
@@ -38,15 +41,34 @@ func NewWatcher() (*Watcher, error) {
 		return nil, os.NewSyscallError("CreateIoCompletionPort", e)
 	}
 	w := &Watcher{
-		port:    port,
-		watches: make(watchMap),
-		input:   make(chan *input, 1),
-		Events:  make(chan Event, 50),
-		Errors:  make(chan error),
-		quit:    make(chan chan<- error, 1),
+		port:      port,
+		watches:   make(watchMap),
+		input:     make(chan *input, 1),
+		Events:    make(chan Event, 50),
+		Errors:    make(chan error),
+		quit:      make(chan chan<- error, 1),
+		recursive: false,
+		bufSize:   defaultBufSize,
 	}
 	go w.readEvents()
 	return w, nil
+}
+
+func (w *Watcher) SetBufferSize(bufSize int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.bufSize = bufSize
+}
+
+// Recursively watches directories if this file system supports that.
+// Must be called before Add/Remove.
+// Returns an error on failure.
+func (w *Watcher) SetRecursive() error {
+	if len(w.watches) > 0 {
+		return fmt.Errorf("Cannot call SetRecursive after watches are set")
+	}
+	w.recursive = true
+	return nil
 }
 
 // Close removes all watches and closes the events channel.
@@ -170,7 +192,7 @@ type watch struct {
 	mask   uint64            // Directory itself is being watched with these notify flags
 	names  map[string]uint64 // Map of names being watched and their notify flags
 	rename string            // Remembers the old name while renaming a file
-	buf    [4096]byte
+	buf    []byte            // An array to pass to the windows API. Must only be allocated once.
 }
 
 type indexMap map[uint64]*watch
@@ -253,6 +275,7 @@ func (w *Watcher) addWatch(pathname string, flags uint64) error {
 	}
 	w.mu.Lock()
 	watchEntry := w.watches.get(ino)
+	bufSize := w.bufSize
 	w.mu.Unlock()
 	if watchEntry == nil {
 		if _, e := syscall.CreateIoCompletionPort(ino.handle, w.port, 0, 0); e != nil {
@@ -263,6 +286,7 @@ func (w *Watcher) addWatch(pathname string, flags uint64) error {
 			ino:   ino,
 			path:  dir,
 			names: make(map[string]uint64),
+			buf:   make([]byte, bufSize),
 		}
 		w.mu.Lock()
 		w.watches.set(ino, watchEntry)
@@ -349,8 +373,11 @@ func (w *Watcher) startRead(watch *watch) error {
 		w.mu.Unlock()
 		return nil
 	}
-	e := syscall.ReadDirectoryChanges(watch.ino.handle, &watch.buf[0],
-		uint32(unsafe.Sizeof(watch.buf)), false, mask, nil, &watch.ov, 0)
+
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&watch.buf))
+
+	e := syscall.ReadDirectoryChanges(watch.ino.handle, (*byte)(unsafe.Pointer(hdr.Data)),
+		uint32(hdr.Len), w.recursive, mask, nil, &watch.ov, 0)
 	if e != nil {
 		err := os.NewSyscallError("ReadDirectoryChanges", e)
 		if e == syscall.ERROR_ACCESS_DENIED && watch.mask&provisional == 0 {
@@ -462,7 +489,8 @@ func (w *Watcher) readEvents() {
 			sh.Data = uintptr(unsafe.Pointer(&raw.FileName))
 			sh.Len = size
 			sh.Cap = size
-			name := syscall.UTF16ToString(buf)
+			buf := (*[syscall.MAX_PATH]uint16)(unsafe.Pointer(&raw.FileName))
+			name := syscall.UTF16ToString(buf[:raw.FileNameLength/2])
 			fullname := filepath.Join(watch.path, name)
 
 			var mask uint64
